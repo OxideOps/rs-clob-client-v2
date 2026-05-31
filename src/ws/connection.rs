@@ -239,7 +239,7 @@ where
         let (pong_tx, pong_rx) = watch::channel(Instant::now());
         let (ping_tx, mut ping_rx) = mpsc::unbounded_channel();
 
-        let heartbeat_handle = tokio::spawn(async move {
+        let mut heartbeat_handle = tokio::spawn(async move {
             Self::heartbeat_loop(ping_tx, state_rx, &config, pong_rx).await;
         });
 
@@ -304,6 +304,22 @@ where
                     if write.send(Message::Text("PING".into())).await.is_err() {
                         break;
                     }
+                }
+
+                // Heartbeat task exited. While the connection is live this only
+                // happens when the heartbeat detected a dead link (no PONG within
+                // the timeout, or a stale PONG), so surface an error to force
+                // `connection_loop` to tear down and reconnect. Without this the
+                // message loop would park on `read.next()` forever on a half-open
+                // socket and never recover.
+                res = &mut heartbeat_handle => {
+                    #[cfg(feature = "tracing")]
+                    if let Err(e) = &res {
+                        tracing::warn!(%e, "Heartbeat task ended unexpectedly");
+                    }
+                    #[cfg(not(feature = "tracing"))]
+                    let _ = res;
+                    return Err(Error::with_source(Kind::WebSocket, WsError::Timeout));
                 }
 
                 // Check if connection is still active
