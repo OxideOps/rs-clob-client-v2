@@ -116,6 +116,8 @@ impl serde_with::SerializeAs<String> for StringFromAny {
 pub fn deserialize_with_warnings<T: DeserializeOwned>(value: Value) -> crate::Result<T> {
     use std::any::type_name;
 
+    use field_warnings::{format_value, lookup_value};
+
     tracing::trace!(
         type_name = %type_name::<T>(),
         json = %value,
@@ -185,114 +187,126 @@ pub fn deserialize_with_warnings<T: DeserializeOwned>(value: Value) -> crate::Re
     Ok(serde_json::from_value(value)?)
 }
 
-/// Look up a value in a JSON structure by path.
+/// Helpers for locating and formatting field values when emitting warnings
+/// about unknown or mismatched fields in API responses.
 ///
-/// Handles paths from both `serde_ignored` and `serde_path_to_error`:
-/// - `?` for Option wrappers (skipped, as JSON has no Option representation)
-/// - Numeric indices for arrays: `items.0` or `items[0]`
-/// - Field names for objects: `foo.bar` or `foo.bar[0].baz`
-///
-/// Returns `None` if the path doesn't exist or traverses a non-container value.
-#[cfg(feature = "tracing")]
-fn lookup_value<'value>(value: &'value Value, path: &str) -> Option<&'value Value> {
-    if path.is_empty() {
-        return Some(value);
-    }
+/// Gated on `tracing` plus an API feature: these are only reachable from the
+/// `tracing` build of [`deserialize_with_warnings`], and they need
+/// `serde_json::Value`, which is only imported under an API feature.
+#[cfg(all(
+    feature = "tracing",
+    any(
+        feature = "bridge",
+        feature = "clob",
+        feature = "data",
+        feature = "gamma"
+    )
+))]
+mod field_warnings {
+    use serde_json::Value;
 
-    let mut current = value;
-
-    // Parse path segments, handling both dot notation and bracket notation
-    // e.g., "data[15].condition_id" -> ["data", "15", "condition_id"]
-    let segments = parse_path_segments(path);
-
-    for segment in segments {
-        if segment.is_empty() || segment == "?" {
-            continue;
+    /// Look up a value in a JSON structure by path.
+    ///
+    /// Handles paths from both `serde_ignored` and `serde_path_to_error`:
+    /// - `?` for Option wrappers (skipped, as JSON has no Option representation)
+    /// - Numeric indices for arrays: `items.0` or `items[0]`
+    /// - Field names for objects: `foo.bar` or `foo.bar[0].baz`
+    ///
+    /// Returns `None` if the path doesn't exist or traverses a non-container value.
+    pub(super) fn lookup_value<'value>(
+        value: &'value Value,
+        path: &str,
+    ) -> Option<&'value Value> {
+        if path.is_empty() {
+            return Some(value);
         }
 
-        match current {
-            Value::Object(map) => {
-                current = map.get(&segment)?;
+        let mut current = value;
+
+        // Parse path segments, handling both dot notation and bracket notation
+        // e.g., "data[15].condition_id" -> ["data", "15", "condition_id"]
+        let segments = parse_path_segments(path);
+
+        for segment in segments {
+            if segment.is_empty() || segment == "?" {
+                continue;
             }
-            Value::Array(arr) => {
-                let index: usize = segment.parse().ok()?;
-                current = arr.get(index)?;
+
+            match current {
+                Value::Object(map) => {
+                    current = map.get(&segment)?;
+                }
+                Value::Array(arr) => {
+                    let index: usize = segment.parse().ok()?;
+                    current = arr.get(index)?;
+                }
+                _ => return None,
             }
-            _ => return None,
         }
+
+        Some(current)
     }
 
-    Some(current)
-}
+    /// Parse a path string into segments, handling both dot and bracket notation.
+    ///
+    /// Examples:
+    /// - `"foo.bar"` -> `["foo", "bar"]`
+    /// - `"data[15].condition_id"` -> `["data", "15", "condition_id"]`
+    /// - `"items[0][1].value"` -> `["items", "0", "1", "value"]`
+    fn parse_path_segments(path: &str) -> Vec<String> {
+        let mut segments = Vec::new();
+        let mut current = String::new();
 
-/// Parse a path string into segments, handling both dot and bracket notation.
-///
-/// Examples:
-/// - `"foo.bar"` -> `["foo", "bar"]`
-/// - `"data[15].condition_id"` -> `["data", "15", "condition_id"]`
-/// - `"items[0][1].value"` -> `["items", "0", "1", "value"]`
-#[cfg(feature = "tracing")]
-fn parse_path_segments(path: &str) -> Vec<String> {
-    let mut segments = Vec::new();
-    let mut current = String::new();
-
-    let mut chars = path.chars().peekable();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '.' => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
-            }
-            '[' => {
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
-                }
-                // Collect until closing bracket
-                for inner in chars.by_ref() {
-                    if inner == ']' {
-                        break;
+        let mut chars = path.chars().peekable();
+        while let Some(ch) = chars.next() {
+            match ch {
+                '.' => {
+                    if !current.is_empty() {
+                        segments.push(std::mem::take(&mut current));
                     }
-                    current.push(inner);
                 }
-                if !current.is_empty() {
-                    segments.push(std::mem::take(&mut current));
+                '[' => {
+                    if !current.is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
+                    // Collect until closing bracket
+                    for inner in chars.by_ref() {
+                        if inner == ']' {
+                            break;
+                        }
+                        current.push(inner);
+                    }
+                    if !current.is_empty() {
+                        segments.push(std::mem::take(&mut current));
+                    }
                 }
-            }
-            ']' => {
-                // Shouldn't happen if well-formed, but handle gracefully
-            }
-            _ => {
-                current.push(ch);
+                ']' => {
+                    // Shouldn't happen if well-formed, but handle gracefully
+                }
+                _ => {
+                    current.push(ch);
+                }
             }
         }
+
+        if !current.is_empty() {
+            segments.push(current);
+        }
+
+        segments
     }
 
-    if !current.is_empty() {
-        segments.push(current);
-    }
-
-    segments
-}
-
-/// Format a JSON value for logging.
-#[cfg(feature = "tracing")]
-fn format_value(value: Option<&Value>) -> String {
-    match value {
-        Some(v) => v.to_string(),
-        None => "<unable to retrieve>".to_owned(),
+    /// Format a JSON value for logging.
+    pub(super) fn format_value(value: Option<&Value>) -> String {
+        match value {
+            Some(v) => v.to_string(),
+            None => "<unable to retrieve>".to_owned(),
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Imports for tracing-gated tests in the outer module
-    #[cfg(feature = "tracing")]
-    use serde_json::Value;
-
-    #[cfg(feature = "tracing")]
-    use super::{format_value, lookup_value};
-
     // ========== deserialize_with_warnings tests ==========
     #[cfg(any(
         feature = "bridge",
@@ -593,139 +607,139 @@ mod tests {
         }
     }
 
-    // ========== lookup_value tests ==========
+    // ========== lookup_value / format_value tests ==========
+    #[cfg(all(
+        feature = "tracing",
+        any(
+            feature = "bridge",
+            feature = "clob",
+            feature = "data",
+            feature = "gamma"
+        )
+    ))]
+    mod field_warnings_tests {
+        use serde_json::Value;
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_simple_path() {
-        let json = serde_json::json!({
-            "foo": "bar"
-        });
+        use super::super::field_warnings::{format_value, lookup_value};
 
-        let result = lookup_value(&json, "foo");
-        assert_eq!(result, Some(&Value::String("bar".to_owned())));
-    }
+        #[test]
+        fn lookup_simple_path() {
+            let json = serde_json::json!({
+                "foo": "bar"
+            });
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_nested_path() {
-        let json = serde_json::json!({
-            "outer": {
-                "inner": "value"
-            }
-        });
+            let result = lookup_value(&json, "foo");
+            assert_eq!(result, Some(&Value::String("bar".to_owned())));
+        }
 
-        let result = lookup_value(&json, "outer.inner");
-        assert_eq!(result, Some(&Value::String("value".to_owned())));
-    }
+        #[test]
+        fn lookup_nested_path() {
+            let json = serde_json::json!({
+                "outer": {
+                    "inner": "value"
+                }
+            });
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_array_index() {
-        let json = serde_json::json!({
-            "items": ["a", "b", "c"]
-        });
+            let result = lookup_value(&json, "outer.inner");
+            assert_eq!(result, Some(&Value::String("value".to_owned())));
+        }
 
-        let result = lookup_value(&json, "items.1");
-        assert_eq!(result, Some(&Value::String("b".to_owned())));
-    }
+        #[test]
+        fn lookup_array_index() {
+            let json = serde_json::json!({
+                "items": ["a", "b", "c"]
+            });
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_empty_path_returns_root() {
-        let json = serde_json::json!({"foo": "bar"});
-        let result = lookup_value(&json, "");
-        assert_eq!(result, Some(&json));
-    }
+            let result = lookup_value(&json, "items.1");
+            assert_eq!(result, Some(&Value::String("b".to_owned())));
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_consecutive_dots_handled() {
-        let json = serde_json::json!({"foo": {"bar": "value"}});
-        // Path "foo..bar" should skip the empty segment and find "foo.bar"
-        let result = lookup_value(&json, "foo..bar");
-        assert_eq!(result, Some(&Value::String("value".to_owned())));
-    }
+        #[test]
+        fn lookup_empty_path_returns_root() {
+            let json = serde_json::json!({"foo": "bar"});
+            let result = lookup_value(&json, "");
+            assert_eq!(result, Some(&json));
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_leading_dot_handled() {
-        let json = serde_json::json!({"foo": "bar"});
-        // Path ".foo" should skip the leading empty segment
-        let result = lookup_value(&json, ".foo");
-        assert_eq!(result, Some(&Value::String("bar".to_owned())));
-    }
+        #[test]
+        fn lookup_consecutive_dots_handled() {
+            let json = serde_json::json!({"foo": {"bar": "value"}});
+            // Path "foo..bar" should skip the empty segment and find "foo.bar"
+            let result = lookup_value(&json, "foo..bar");
+            assert_eq!(result, Some(&Value::String("value".to_owned())));
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_invalid_array_index_returns_none() {
-        let json = serde_json::json!({"items": [1, 2, 3]});
-        let result = lookup_value(&json, "items.abc");
-        assert_eq!(result, None);
-    }
+        #[test]
+        fn lookup_leading_dot_handled() {
+            let json = serde_json::json!({"foo": "bar"});
+            // Path ".foo" should skip the leading empty segment
+            let result = lookup_value(&json, ".foo");
+            assert_eq!(result, Some(&Value::String("bar".to_owned())));
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_array_out_of_bounds_returns_none() {
-        let json = serde_json::json!({"items": [1, 2, 3]});
-        let result = lookup_value(&json, "items.100");
-        assert_eq!(result, None);
-    }
+        #[test]
+        fn lookup_invalid_array_index_returns_none() {
+            let json = serde_json::json!({"items": [1, 2, 3]});
+            let result = lookup_value(&json, "items.abc");
+            assert_eq!(result, None);
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_through_primitive_returns_none() {
-        let json = serde_json::json!({"foo": "bar"});
-        // Can't traverse through a string
-        let result = lookup_value(&json, "foo.baz");
-        assert_eq!(result, None);
-    }
+        #[test]
+        fn lookup_array_out_of_bounds_returns_none() {
+            let json = serde_json::json!({"items": [1, 2, 3]});
+            let result = lookup_value(&json, "items.100");
+            assert_eq!(result, None);
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn format_shows_full_string() {
-        let long_string = "a".repeat(300);
-        let value = Value::String(long_string.clone());
+        #[test]
+        fn lookup_through_primitive_returns_none() {
+            let json = serde_json::json!({"foo": "bar"});
+            // Can't traverse through a string
+            let result = lookup_value(&json, "foo.baz");
+            assert_eq!(result, None);
+        }
 
-        let formatted = format_value(Some(&value));
-        // Full JSON string with quotes
-        assert_eq!(formatted, format!("\"{long_string}\""));
-    }
+        #[test]
+        fn format_shows_full_string() {
+            let long_string = "a".repeat(300);
+            let value = Value::String(long_string.clone());
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn format_array_shows_full_json() {
-        let value = serde_json::json!([1, 2, 3, 4, 5]);
+            let formatted = format_value(Some(&value));
+            // Full JSON string with quotes
+            assert_eq!(formatted, format!("\"{long_string}\""));
+        }
 
-        let formatted = format_value(Some(&value));
-        assert_eq!(formatted, "[1,2,3,4,5]");
-    }
+        #[test]
+        fn format_array_shows_full_json() {
+            let value = serde_json::json!([1, 2, 3, 4, 5]);
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn format_object_shows_full_json() {
-        let value = serde_json::json!({"a": 1, "b": 2});
+            let formatted = format_value(Some(&value));
+            assert_eq!(formatted, "[1,2,3,4,5]");
+        }
 
-        let formatted = format_value(Some(&value));
-        // JSON object serialization order may vary, check both keys present
-        assert!(formatted.contains("\"a\":1"));
-        assert!(formatted.contains("\"b\":2"));
-    }
+        #[test]
+        fn format_object_shows_full_json() {
+            let value = serde_json::json!({"a": 1, "b": 2});
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn format_none_shows_placeholder() {
-        let formatted = format_value(None);
-        assert_eq!(formatted, "<unable to retrieve>");
-    }
+            let formatted = format_value(Some(&value));
+            // JSON object serialization order may vary, check both keys present
+            assert!(formatted.contains("\"a\":1"));
+            assert!(formatted.contains("\"b\":2"));
+        }
 
-    #[cfg(feature = "tracing")]
-    #[test]
-    fn lookup_option_marker_skipped() {
-        // serde_ignored uses '?' for Option wrappers
-        let json = serde_json::json!({"outer": {"inner": "value"}});
-        // Path "?.outer.?.inner" should skip ? markers
-        let result = lookup_value(&json, "?.outer.?.inner");
-        assert_eq!(result, Some(&Value::String("value".to_owned())));
+        #[test]
+        fn format_none_shows_placeholder() {
+            let formatted = format_value(None);
+            assert_eq!(formatted, "<unable to retrieve>");
+        }
+
+        #[test]
+        fn lookup_option_marker_skipped() {
+            // serde_ignored uses '?' for Option wrappers
+            let json = serde_json::json!({"outer": {"inner": "value"}});
+            // Path "?.outer.?.inner" should skip ? markers
+            let result = lookup_value(&json, "?.outer.?.inner");
+            assert_eq!(result, Some(&Value::String("value".to_owned())));
+        }
     }
 }
