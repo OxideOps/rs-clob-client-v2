@@ -5,6 +5,7 @@ use dashmap::mapref::one::{Ref, RefMut};
 use dashmap::{DashMap, Entry};
 use futures::Stream;
 use futures::StreamExt as _;
+use tokio::sync::watch;
 
 use super::interest::InterestTracker;
 use super::subscription::{ChannelType, SubscriptionManager};
@@ -378,6 +379,21 @@ impl<S: State> Client<S> {
         self.inner.channel(channel_type).is_some()
     }
 
+    /// Watch connection-state changes for a channel, for event-driven
+    /// reconnect detection.
+    ///
+    /// Returns `None` until a first subscription has created the channel; call
+    /// it after subscribing. The receiver observes every state transition
+    /// (`Connecting`, `Connected`, `Reconnecting`, `Disconnected`), so a
+    /// disconnect/reconnect cycle can be detected without polling.
+    #[must_use]
+    pub fn state_receiver(
+        &self,
+        channel_type: ChannelType,
+    ) -> Option<watch::Receiver<ConnectionState>> {
+        self.inner.channel(channel_type).map(|r| r.state_receiver())
+    }
+
     /// Get the number of active subscriptions.
     #[must_use]
     pub fn subscription_count(&self) -> usize {
@@ -640,6 +656,10 @@ impl ChannelResources {
 
     fn connection_state(&self) -> ConnectionState {
         self.connection.state()
+    }
+
+    fn state_receiver(&self) -> watch::Receiver<ConnectionState> {
+        self.connection.state_receiver()
     }
 }
 
